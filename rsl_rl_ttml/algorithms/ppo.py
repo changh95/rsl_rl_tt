@@ -241,6 +241,12 @@ class PPO:
             current_values = ttml_to_numpy(critic_output, original_shape=(B, 1))
             value_loss = ((current_values - batch.returns) ** 2).mean()
 
+            # === Update std (entropy) via REINFORCE gradient ===
+            if self.actor.distribution is not None:
+                self.actor.distribution.update_std(
+                    batch.actions, advantages, lr=self.learning_rate * 0.5
+                )
+
             # === Adaptive LR ===
             if self.desired_kl is not None and self.schedule == "adaptive":
                 new_params = (current_mean, std.copy())

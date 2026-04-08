@@ -131,6 +131,12 @@ class GymVecEnv(VecEnv):
         self.max_episode_length = sample_env.spec.max_episode_steps or 200
         self.episode_length_buf = np.zeros(num_envs, dtype=np.int32)
 
+        # Action scaling: map from [-1, 1] (policy output) to env action range
+        self._act_low = act_space.low.astype(np.float32)
+        self._act_high = act_space.high.astype(np.float32)
+        self._act_scale = (self._act_high - self._act_low) / 2.0
+        self._act_offset = (self._act_high + self._act_low) / 2.0
+
         self._obs_dim = obs_space.shape[0]
         self._obs = np.zeros((num_envs, self._obs_dim), dtype=np.float32)
 
@@ -148,7 +154,8 @@ class GymVecEnv(VecEnv):
         time_outs = np.zeros(self.num_envs, dtype=np.float32)
 
         for i, env in enumerate(self._envs):
-            action = actions[i]
+            # Scale action from policy range to env range
+            action = np.tanh(actions[i]) * self._act_scale + self._act_offset
             obs, reward, terminated, truncated, info = env.step(action)
             self._obs[i] = obs
             rewards[i] = reward
