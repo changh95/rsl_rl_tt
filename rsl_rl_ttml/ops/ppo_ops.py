@@ -117,10 +117,13 @@ class SurrogateLoss(ttml.autograd.Function):
         mean_np = mean_np_full[:B, :A]
 
         var = std_np ** 2
+        log_std = np.log(std_np)
 
-        # Compute log prob
-        log_prob = -0.5 * np.sum((actions_np - mean_np) ** 2 / var, axis=-1)
-        # Remove constants (they cancel in ratio)
+        # Compute log prob (must include all terms to match old_log_prob)
+        log_prob = -0.5 * np.sum(
+            (actions_np - mean_np) ** 2 / var + np.log(2.0 * np.pi) + 2.0 * log_std,
+            axis=-1
+        )
 
         # Ratio
         ratio = np.exp(np.clip(log_prob - old_log_prob_np, -20.0, 20.0))

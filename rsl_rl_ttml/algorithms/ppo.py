@@ -179,23 +179,46 @@ class PPO:
             current_mean = ttml_to_numpy(actor_output, original_shape=(B, self.actor.output_dim))
 
             std = self.actor.distribution.std
+            var = std ** 2
+            log_std = np.log(std)
             old_log_prob = batch.old_actions_log_prob.squeeze(-1)
 
             # Update distribution for KL/entropy computation
             self.actor.distribution.update(current_mean)
 
-            # Compute PPO surrogate loss via custom autograd function
-            # This computes the full PPO loss with proper gradient d(loss)/d(mean)
-            # flowing back through the MLP via autograd
-            actor_loss_tensor = SurrogateLoss.apply(
-                actor_output,
-                batch.actions,
-                old_log_prob,
-                advantages,
-                std,
-                self.clip_param,
+            # Compute PPO gradient analytically in numpy
+            new_log_prob = -0.5 * np.sum(
+                (batch.actions - current_mean) ** 2 / var + np.log(2.0 * np.pi) + 2.0 * log_std,
+                axis=-1
             )
-            surrogate_loss = float(actor_loss_tensor.to_numpy(ttnn.DataType.FLOAT32).flat[0])
+            ratio = np.exp(np.clip(new_log_prob - old_log_prob, -20.0, 20.0))
+            clipped_ratio = np.clip(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+
+            surr1 = -advantages * ratio
+            surr2 = -advantages * clipped_ratio
+            surrogate_loss = np.maximum(surr1, surr2).mean()
+
+            # PPO gradient d(loss)/d(mean):
+            # Use effective ratio (clipped where appropriate)
+            use_clipped = (surr2 > surr1).astype(np.float32)
+            effective_ratio = ratio * (1.0 - use_clipped) + clipped_ratio * use_clipped
+            d_logprob_d_mean = (batch.actions - current_mean) / var  # [B, A]
+            d_loss_d_mean = (-advantages * effective_ratio)[:, None] * d_logprob_d_mean  # [B, A]
+
+            # Encode gradient into MSE target:
+            # MSE_MEAN gradient: d(MSE)/d(out) = 2*(out - target)/N
+            # PPO loss gradient: d(L)/d(mean) = d_loss_d_mean (already per-sample)
+            # We want the MSE gradient to match the mean PPO gradient:
+            #   2*(out - target)/N = mean(d_loss_d_mean)
+            #   target = out - N/2 * mean(d_loss_d_mean)
+            # But since mse_loss(MEAN) divides by total elements (B*D), and we have
+            # per-sample gradients, the correct scale is:
+            #   target = out - 0.5 * d_loss_d_mean
+            actor_target = (current_mean - 0.5 * d_loss_d_mean).astype(np.float32)
+            actor_target_ttml = numpy_to_ttml(actor_target)
+
+            # Actor loss via mse_loss - gradients flow through MLP via ttml autograd
+            actor_loss = ttml.ops.loss.mse_loss(actor_output, actor_target_ttml, ttml.ops.ReduceType.MEAN)
 
             # === Critic update on NPU ===
             critic_latent = self.critic._get_latent_np(batch.observations)
@@ -208,7 +231,7 @@ class PPO:
 
             # Backward both actor and critic, then optimizer step
             self.optimizer.zero_grad()
-            actor_loss_tensor.backward(False)
+            actor_loss.backward(False)
             critic_loss.backward(False)
             self.optimizer.step()
             ctx.reset_graph()
