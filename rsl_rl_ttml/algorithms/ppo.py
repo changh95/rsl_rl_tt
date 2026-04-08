@@ -21,11 +21,12 @@ from __future__ import annotations
 import numpy as np
 
 import ttml
-import ttnn
+import ttnn  # noqa: F401
 
 from rsl_rl_ttml.models.mlp_model import MLPModel
 from rsl_rl_ttml.storage.rollout_storage import RolloutStorage
 from rsl_rl_ttml.utils.tensor_utils import numpy_to_ttml, ttml_to_numpy, pad_to_tile
+from rsl_rl_ttml.ops.ppo_ops import SurrogateLoss
 
 
 class PPO:
@@ -177,46 +178,24 @@ class PPO:
             actor_output = self.actor.forward_ttml(actor_input)
             current_mean = ttml_to_numpy(actor_output, original_shape=(B, self.actor.output_dim))
 
-            # Compute PPO policy gradient target in numpy
             std = self.actor.distribution.std
-            var = std ** 2
-
-            # Recompute log probs with current mean
-            self.actor.distribution.update(current_mean)
-            new_log_prob = self.actor.distribution.log_prob(batch.actions)
             old_log_prob = batch.old_actions_log_prob.squeeze(-1)
 
-            # PPO ratio and clipping
-            ratio = np.exp(np.clip(new_log_prob - old_log_prob, -20.0, 20.0))
-            clipped_ratio = np.clip(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            # Update distribution for KL/entropy computation
+            self.actor.distribution.update(current_mean)
 
-            # Surrogate loss (for logging)
-            surr1 = -advantages * ratio
-            surr2 = -advantages * clipped_ratio
-            surrogate_loss = np.maximum(surr1, surr2).mean()
-
-            # PPO clipping mask: zero gradient when clipping is active
-            # Clipping is active when surr2 > surr1 (clipped version is worse)
-            clip_mask = (surr1 >= surr2).astype(np.float32)  # [B], 1.0 = unclipped
-
-            # Natural policy gradient direction: advantage * (action - mean) / var
-            # Positive advantage -> move mean toward action
-            # Negative advantage -> move mean away from action
-            d_logprob_d_mean = (batch.actions - current_mean) / var  # [B, A]
-            pg_direction = advantages[:, None] * d_logprob_d_mean  # [B, A]
-
-            # Apply PPO clip mask (zero out clipped samples)
-            pg_direction *= clip_mask[:, None]
-
-            # Create regression target: nudge mean in the policy gradient direction
-            # Small step size to keep updates stable
-            pg_step = 0.1
-            actor_target = (current_mean + pg_step * pg_direction).astype(np.float32)
-            actor_target_ttml = numpy_to_ttml(actor_target)
-
-            # Compute actor loss on NPU (mse_loss with backward)
-            self.optimizer.zero_grad()
-            actor_loss = ttml.ops.loss.mse_loss(actor_output, actor_target_ttml, ttml.ops.ReduceType.MEAN)
+            # Compute PPO surrogate loss via custom autograd function
+            # This computes the full PPO loss with proper gradient d(loss)/d(mean)
+            # flowing back through the MLP via autograd
+            actor_loss_tensor = SurrogateLoss.apply(
+                actor_output,
+                batch.actions,
+                old_log_prob,
+                advantages,
+                std,
+                self.clip_param,
+            )
+            surrogate_loss = float(actor_loss_tensor.to_numpy(ttnn.DataType.FLOAT32).flat[0])
 
             # === Critic update on NPU ===
             critic_latent = self.critic._get_latent_np(batch.observations)
@@ -227,9 +206,9 @@ class PPO:
             value_target = numpy_to_ttml(batch.returns.astype(np.float32))
             critic_loss = ttml.ops.loss.mse_loss(critic_output, value_target, ttml.ops.ReduceType.MEAN)
 
-            # Combined loss: we need to backward both
-            # Since they share the optimizer, we can backward sequentially
-            actor_loss.backward(False)
+            # Backward both actor and critic, then optimizer step
+            self.optimizer.zero_grad()
+            actor_loss_tensor.backward(False)
             critic_loss.backward(False)
             self.optimizer.step()
             ctx.reset_graph()
