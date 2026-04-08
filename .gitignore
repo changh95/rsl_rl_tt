@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.omc/
+generated/
+tt-metal/
+rsl_rl_tt/
