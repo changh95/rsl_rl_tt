@@ -167,7 +167,7 @@ def benchmark_bandit(num_iters: int = 100):
     return improved, pre_eval, post_eval
 
 
-def benchmark_pendulum(num_iters: int = 500):
+def benchmark_pendulum(num_iters: int = 1000):
     """Test: classic Pendulum-v1 from Gymnasium."""
     from rsl_rl_ttml.envs.test_envs import GymVecEnv
     from rsl_rl_ttml.runners.on_policy_runner import OnPolicyRunner
@@ -178,7 +178,7 @@ def benchmark_pendulum(num_iters: int = 500):
     print("=" * 70)
 
     env = GymVecEnv("Pendulum-v1", num_envs=128)
-    cfg = make_train_cfg(num_steps=32, hidden_dims=(64, 64), lr=1e-3)
+    cfg = make_train_cfg(num_steps=32, hidden_dims=(64, 64), lr=3e-4)
     runner = OnPolicyRunner(env, cfg)
 
     pre_eval = evaluate_policy(runner, env)
@@ -208,7 +208,7 @@ if __name__ == "__main__":
     r2 = benchmark_bandit(num_iters=100)
     results["bandit"] = r2[0]
 
-    r3 = benchmark_pendulum(num_iters=500)
+    r3 = benchmark_pendulum(num_iters=1000)
     results["pendulum"] = r3[0]
 
     print()
