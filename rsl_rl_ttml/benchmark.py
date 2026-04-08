@@ -208,7 +208,7 @@ if __name__ == "__main__":
     r2 = benchmark_bandit(num_iters=100)
     results["bandit"] = r2[0]
 
-    r3 = benchmark_pendulum(num_iters=150)
+    r3 = benchmark_pendulum(num_iters=300)
     results["pendulum"] = r3[0]
 
     print()
