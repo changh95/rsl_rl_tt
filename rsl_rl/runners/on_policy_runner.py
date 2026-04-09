@@ -15,6 +15,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
+from rsl_rl.utils.ttml_bridge import is_ttml_device, init_ttml_device, close_ttml_device
 
 
 class OnPolicyRunner:
@@ -28,6 +29,11 @@ class OnPolicyRunner:
         self.env = env
         self.cfg = train_cfg
         self.device = device
+        self._is_ttml = is_ttml_device(device)
+
+        # Initialize Tenstorrent NPU if using ttml device
+        if self._is_ttml:
+            self._ttml_ctx = init_ttml_device()
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
@@ -39,7 +45,7 @@ class OnPolicyRunner:
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
-        # Create the logger
+        # Create the logger (use CPU for ttml - logger only needs torch tensors for bookkeeping)
         self.logger = Logger(
             log_dir=log_dir,
             cfg=self.cfg,
@@ -48,7 +54,7 @@ class OnPolicyRunner:
             is_distributed=self.is_distributed,
             gpu_world_size=self.gpu_world_size,
             gpu_global_rank=self.gpu_global_rank,
-            device=self.device,
+            device="cpu" if self._is_ttml else self.device,
         )
 
         self.current_learning_iteration = 0
@@ -61,8 +67,8 @@ class OnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
-        # Start learning
-        obs = self.env.get_observations().to(self.device)
+        # Start learning (ttml data stays on CPU; NPU transfers happen in update())
+        obs = self.env.get_observations().to("cpu" if self._is_ttml else self.device)
         self.alg.train_mode()  # switch to train mode (for dropout for example)
 
         # Ensure all parameters are in-synced
@@ -88,8 +94,9 @@ class OnPolicyRunner:
                     # Check for NaN values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
-                    # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Move to device (ttml keeps data on CPU; NPU transfers in update())
+                    _dev = "cpu" if self._is_ttml else self.device
+                    obs, rewards, dones = (obs.to(_dev), rewards.to(_dev), dones.to(_dev))
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
@@ -199,6 +206,11 @@ class OnPolicyRunner:
             input_names=onnx_model.input_names,  # type: ignore
             output_names=onnx_model.output_names,  # type: ignore
         )
+
+    def close(self) -> None:
+        """Clean up resources. Call this when done with training on ttml devices."""
+        if self._is_ttml:
+            close_ttml_device()
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""

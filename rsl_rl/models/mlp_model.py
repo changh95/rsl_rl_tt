@@ -12,6 +12,8 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules.mlp import TtmlMLP
+from rsl_rl.utils.ttml_bridge import is_ttml_device
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
@@ -37,6 +39,7 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        device: str = "cpu",
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -72,11 +75,15 @@ class MLPModel(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        # MLP - use TtmlMLP when running on Tenstorrent NPU
+        self._is_ttml = is_ttml_device(device)
+        if self._is_ttml:
+            self.mlp = TtmlMLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        else:
+            self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
 
         # Initialize distribution-specific MLP weights
-        if self.distribution is not None:
+        if self.distribution is not None and not self._is_ttml:
             self.distribution.init_mlp_weights(self.mlp)
 
     def forward(

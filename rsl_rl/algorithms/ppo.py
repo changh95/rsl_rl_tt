@@ -17,6 +17,7 @@ from rsl_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, res
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
+from rsl_rl.utils.ttml_bridge import is_ttml_device, torch_to_ttml, ttml_to_torch
 
 
 class PPO:
@@ -109,13 +110,35 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.actor = actor.to(self.device)
-        self.critic = critic.to(self.device)
+        self._is_ttml = is_ttml_device(self.device)
+        if not self._is_ttml:
+            self.actor = actor.to(self.device)
+            self.critic = critic.to(self.device)
+        else:
+            self.actor = actor  # TtmlMLP stays on NPU, no .to() needed
+            self.critic = critic
 
         # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
-        )  # type: ignore
+        if self._is_ttml:
+            import ttml
+            all_params = ttml.NamedParameters()
+            for name, param in self.actor.mlp.ttml_named_parameters().items():
+                all_params[f"actor.{name}"] = param
+            for name, param in self.critic.mlp.ttml_named_parameters().items():
+                all_params[f"critic.{name}"] = param
+            opt_config = ttml.optimizers.AdamWConfig.make(
+                lr=learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-8, weight_decay=0.0,
+            )
+            self.ttml_optimizer = ttml.optimizers.AdamW(all_params, opt_config)
+            # Dummy torch optimizer (unused but keeps API consistent for save/load)
+            self.optimizer = torch.optim.Adam(
+                chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            )
+        else:
+            self.ttml_optimizer = None
+            self.optimizer = resolve_optimizer(optimizer)(
+                chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            )  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -174,7 +197,7 @@ class PPO:
         # Bootstrapping on time outs
         if "time_outs" in extras:
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
+                self.transition.values * extras["time_outs"].unsqueeze(1).to("cpu" if self._is_ttml else self.device),  # type: ignore
                 1,
             )
 
@@ -210,6 +233,140 @@ class PPO:
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        if self._is_ttml:
+            return self._update_ttml()
+        return self._update_torch()
+
+    def _update_ttml(self) -> dict[str, float]:
+        """PPO update using ttml NPU for forward/backward/optimizer."""
+        import numpy as np
+        import ttml
+        ctx = ttml.autograd.AutoContext.get_instance()
+
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_entropy = 0.0
+
+        generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
+        for batch in generator:
+            B = batch.observations.batch_size[0]
+
+            # Normalize advantages
+            if self.normalize_advantage_per_mini_batch:
+                batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
+
+            advantages = batch.advantages.squeeze(-1).cpu().numpy()
+
+            # === Actor forward on NPU ===
+            obs_list = [batch.observations[g] for g in self.actor.obs_groups]
+            latent = torch.cat(obs_list, dim=-1)
+            if self.actor.obs_normalization:
+                latent = self.actor.obs_normalizer(latent)
+            latent_np = latent.cpu().numpy()
+
+            actor_input = torch_to_ttml(latent)
+            actor_output = self.actor.mlp.ttml_forward(actor_input)
+            current_mean = ttml_to_torch(actor_output, original_shape=(B, self.actor.mlp.output_dim)).numpy()
+
+            # Compute PPO gradient analytically
+            actions_np = batch.actions.cpu().numpy()
+            old_log_prob = batch.old_actions_log_prob.squeeze(-1).cpu().numpy()
+
+            # Get raw per-action std (not batch-expanded)
+            if hasattr(self.actor.distribution, 'std_param'):
+                std = self.actor.distribution.std_param.detach().cpu().numpy()
+            elif hasattr(self.actor.distribution, 'log_std_param'):
+                std = torch.exp(self.actor.distribution.log_std_param).detach().cpu().numpy()
+            else:
+                std = self.actor.output_std[0].detach().cpu().numpy()
+            var = std ** 2
+            log_std = np.log(std)
+
+            # Recompute log prob with current mean (include all terms)
+            new_log_prob = -0.5 * np.sum(
+                (actions_np - current_mean) ** 2 / var + np.log(2.0 * np.pi) + 2.0 * log_std,
+                axis=-1
+            )
+            ratio = np.exp(np.clip(new_log_prob - old_log_prob, -20.0, 20.0))
+            clipped_ratio = np.clip(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+
+            surr1 = -advantages * ratio
+            surr2 = -advantages * clipped_ratio
+            surrogate_loss = np.maximum(surr1, surr2).mean()
+
+            # PPO gradient d(loss)/d(mean)
+            use_clipped = (surr2 > surr1).astype(np.float32)
+            effective_ratio = ratio * (1.0 - use_clipped) + clipped_ratio * use_clipped
+            d_logprob_d_mean = (actions_np - current_mean) / var
+            d_loss_d_mean = (-advantages * effective_ratio)[:, None] * d_logprob_d_mean
+
+            # Encode PPO gradient into MSE target
+            actor_target_np = (current_mean - 0.5 * d_loss_d_mean).astype(np.float32)
+            actor_target = torch_to_ttml(torch.from_numpy(actor_target_np))
+
+            # Actor loss on NPU
+            actor_loss = ttml.ops.loss.mse_loss(actor_output, actor_target, ttml.ops.ReduceType.MEAN)
+
+            # === Critic forward on NPU ===
+            critic_obs_list = [batch.observations[g] for g in self.critic.obs_groups]
+            critic_latent = torch.cat(critic_obs_list, dim=-1)
+            if self.critic.obs_normalization:
+                critic_latent = self.critic.obs_normalizer(critic_latent)
+
+            critic_input = torch_to_ttml(critic_latent)
+            critic_output = self.critic.mlp.ttml_forward(critic_input)
+
+            # Value target
+            returns_np = batch.returns.cpu().numpy()
+            value_target = torch_to_ttml(batch.returns)
+            critic_loss = ttml.ops.loss.mse_loss(critic_output, value_target, ttml.ops.ReduceType.MEAN)
+
+            # Backward + optimizer step on NPU
+            self.ttml_optimizer.zero_grad()
+            actor_loss.backward(False)
+            critic_loss.backward(False)
+            self.ttml_optimizer.step()
+            ctx.reset_graph()
+
+            # Compute metrics for logging
+            current_values = ttml_to_torch(critic_output, original_shape=(B, 1)).numpy()
+            value_loss = ((current_values - returns_np) ** 2).mean()
+            entropy = self.actor.output_entropy.mean().item() if hasattr(self.actor, 'output_entropy') else 0.0
+
+            mean_value_loss += value_loss
+            mean_surrogate_loss += surrogate_loss
+            mean_entropy += entropy
+
+            # Adaptive LR
+            if self.desired_kl is not None and self.schedule == "adaptive":
+                kl_mean = 0.5 * np.mean(np.sum(
+                    np.log(std / std) + (std ** 2 + (current_mean - current_mean) ** 2) / (2 * std ** 2) - 0.5,
+                    axis=-1
+                ))
+                # Use old vs new params for real KL (simplified: use ratio as proxy)
+                kl_proxy = np.mean(np.abs(new_log_prob - old_log_prob))
+                if kl_proxy > self.desired_kl * 2.0:
+                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                elif kl_proxy < self.desired_kl / 2.0 and kl_proxy > 0.0:
+                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                self.ttml_optimizer.set_lr(self.learning_rate)
+
+        num_updates = self.num_learning_epochs * self.num_mini_batches
+        mean_value_loss /= num_updates
+        mean_surrogate_loss /= num_updates
+        mean_entropy /= num_updates
+
+        self.storage.clear()
+
+        return {
+            "value": float(mean_value_loss),
+            "surrogate": float(mean_surrogate_loss),
+            "entropy": float(mean_entropy),
+        }
+
+    def _update_torch(self) -> dict[str, float]:
+        """Original PyTorch PPO update (unchanged)."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
@@ -490,15 +647,24 @@ class PPO:
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
         # Initialize the policy
-        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
-        print(f"Actor Model: {actor}")
-        if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
-            cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
-        print(f"Critic Model: {critic}")
+        if is_ttml_device(device):
+            actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"], device=device)
+            print(f"Actor Model (ttml): {actor}")
+            if cfg["algorithm"].pop("share_cnn_encoders", None):
+                cfg["critic"]["cnns"] = actor.cnns  # type: ignore
+            critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"], device=device)
+            print(f"Critic Model (ttml): {critic}")
+        else:
+            actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+            print(f"Actor Model: {actor}")
+            if cfg["algorithm"].pop("share_cnn_encoders", None):
+                cfg["critic"]["cnns"] = actor.cnns  # type: ignore
+            critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+            print(f"Critic Model: {critic}")
 
-        # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        # Initialize the storage (always on CPU for ttml - data transfers to NPU during update)
+        storage_device = "cpu" if is_ttml_device(device) else device
+        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], storage_device)
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
