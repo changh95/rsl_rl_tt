@@ -95,7 +95,7 @@ def ttml_to_torch(ttml_tensor, original_shape: tuple[int, int]) -> torch.Tensor:
     if num_devices > 1:
         # Gather distributed tensor to host using concat on batch dim
         composer = ttml.core.distributed.concat_mesh_to_tensor_composer(device, 0)
-        arr = ttml_tensor.to_numpy(composer=composer)
+        arr = ttml_tensor.to_numpy(composer=composer).astype(np.float32)
     else:
         arr = ttml_tensor.to_numpy(ttnn.DataType.FLOAT32)
 
@@ -141,6 +141,7 @@ def init_ttml_device(num_devices: int = 1):
             ttml.autograd.DistributedConfig(enable_ddp=True, enable_tp=True)
         )
     elif num_devices == 8:
+        ttml.core.distributed.enable_fabric(8)
         ctx.open_device([2, 4])
         ctx.initialize_parallelism_context(
             ttml.autograd.DistributedConfig(enable_ddp=True, enable_tp=True)
