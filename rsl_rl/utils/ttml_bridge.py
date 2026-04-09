@@ -95,9 +95,10 @@ def ttml_to_torch(ttml_tensor, original_shape: tuple[int, int]) -> torch.Tensor:
     if num_devices > 1:
         # Gather distributed tensor to host using concat on batch dim
         composer = ttml.core.distributed.concat_mesh_to_tensor_composer(device, 0)
-        arr = ttml_tensor.to_numpy(composer=composer).astype(np.float32)
+        arr = np.array(ttml_tensor.to_numpy(composer=composer), dtype=np.float32)
     else:
-        arr = ttml_tensor.to_numpy(ttnn.DataType.FLOAT32)
+        # Use raw to_numpy() and cast - avoids slow on-device typecast
+        arr = np.array(ttml_tensor.to_numpy(), dtype=np.float32)
 
     # Shape is [B_pad, 1, 1, D_pad] - squeeze middle dims
     if arr.ndim == 4:
