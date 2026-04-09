@@ -145,6 +145,12 @@ class MLPModel(nn.Module):
     @property
     def output_std(self) -> torch.Tensor:
         """Return the standard deviation of the current output distribution."""
+        if self.distribution._distribution is None:
+            # Distribution not yet initialized (no forward pass yet) - return raw std param
+            if hasattr(self.distribution, "std_param"):
+                return self.distribution.std_param
+            elif hasattr(self.distribution, "log_std_param"):
+                return torch.exp(self.distribution.log_std_param)
         return self.distribution.std
 
     @property
