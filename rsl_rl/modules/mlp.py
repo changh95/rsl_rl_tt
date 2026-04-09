@@ -159,13 +159,17 @@ class TtmlMLP(nn.Module):
             self._ttml_layers.append(LinearLayer(dims[i], dims[i + 1]))
 
         # Register dummy torch parameters so state_dict/load_state_dict work.
-        # These are synced from ttml weights after each optimizer step.
         self._dummy_params = nn.ParameterList()
         for i in range(len(dims) - 1):
             w = nn.Parameter(torch.zeros(dims[i + 1], dims[i]), requires_grad=False)
             b = nn.Parameter(torch.zeros(dims[i + 1]), requires_grad=False)
             self._dummy_params.append(w)
             self._dummy_params.append(b)
+
+        # CPU inference cache: numpy weight copies for fast CPU-only forward.
+        # Synced from NPU weights via sync_weights_to_cpu() after each optimizer step.
+        self._cpu_weights: list[tuple] | None = None  # [(W, b), ...] per layer
+        self._dims = dims
 
     def ttml_forward(self, x_ttml):
         """Forward pass staying in ttml tensor space (preserves autograd graph for training)."""
@@ -185,16 +189,89 @@ class TtmlMLP(nn.Module):
             params[f"ttml_mlp.{name}"] = param.tensor
         return params
 
+    def sync_weights_to_cpu(self):
+        """Copy NPU weights to CPU numpy cache for fast inference.
+
+        Call this after each optimizer step so the CPU inference path
+        uses the latest weights. This avoids expensive NPU round-trips
+        during the rollout phase.
+        """
+        import numpy as np
+        import ttml
+        import ttnn
+
+        ctx = ttml.autograd.AutoContext.get_instance()
+        device = ctx.get_device()
+        num_devices = device.get_num_devices()
+
+        self._cpu_weights = []
+        for layer in self._ttml_layers:
+            if num_devices > 1:
+                composer = ttml.core.distributed.concat_mesh_to_tensor_composer(device, 0)
+                W = layer.weight.tensor.to_numpy(composer=composer).astype(np.float32)
+            else:
+                W = layer.weight.tensor.to_numpy(ttnn.DataType.FLOAT32)
+            # W shape: [1, 1, out, in] or [N, 1, out, in] for multi-device
+            # Take first replica (weights are identical across DDP replicas)
+            if W.ndim == 4:
+                W = W[0, 0]  # [out, in]
+            elif W.ndim == 3:
+                W = W[0]
+
+            if layer.bias is not None:
+                if num_devices > 1:
+                    b = layer.bias.tensor.to_numpy(composer=composer).astype(np.float32)
+                else:
+                    b = layer.bias.tensor.to_numpy(ttnn.DataType.FLOAT32)
+                if b.ndim == 4:
+                    b = b[0, 0, 0]  # [out]
+                elif b.ndim == 3:
+                    b = b[0, 0]
+                elif b.ndim == 2:
+                    b = b[0]
+            else:
+                b = None
+
+            self._cpu_weights.append((W, b))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: torch.Tensor in, torch.Tensor out. Runs on NPU internally."""
+        """Forward pass: torch.Tensor in, torch.Tensor out.
+
+        Uses CPU numpy cache when available (fast path for rollout inference).
+        Falls back to NPU forward when cache not synced.
+        """
+        import numpy as np
+
         B = x.shape[0]
+        D_in = self.input_dim
         D_out = self.output_dim
 
+        # Fast path: CPU inference using cached numpy weights
+        if self._cpu_weights is not None:
+            h = x.view(B, -1).detach().cpu().numpy().astype(np.float32)
+            # Pad input to match padded dims
+            D_pad = self._dims[0]
+            if h.shape[1] < D_pad:
+                h_padded = np.zeros((B, D_pad), dtype=np.float32)
+                h_padded[:, :h.shape[1]] = h
+                h = h_padded
+
+            for i, (W, b) in enumerate(self._cpu_weights):
+                h = h @ W.T  # [B, out_padded]
+                if b is not None:
+                    h = h + b
+                # Activation for hidden layers
+                if i < self._num_hidden:
+                    h = np.maximum(h, 0)  # ReLU (matches ttml.ops.unary.relu)
+
+            # Unpad output
+            return torch.from_numpy(h[:B, :D_out].copy()).to(x.device)
+
+        # Slow path: NPU forward (used before first sync)
         x_ttml = torch_to_ttml(x.view(B, -1))
         out_ttml = self.ttml_forward(x_ttml)
         result = ttml_to_torch(out_ttml, original_shape=(B, D_out))
 
-        # Reset ttml graph after inference forward (no backward needed)
         import ttml
         ttml.autograd.AutoContext.get_instance().reset_graph()
 

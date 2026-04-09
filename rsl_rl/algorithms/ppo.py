@@ -359,6 +359,10 @@ class PPO:
                     self.learning_rate = min(1e-2, self.learning_rate * 1.5)
                 self.ttml_optimizer.set_lr(self.learning_rate)
 
+        # Sync NPU weights to CPU cache once after all mini-batches
+        self.actor.mlp.sync_weights_to_cpu()
+        self.critic.mlp.sync_weights_to_cpu()
+
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates

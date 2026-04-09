@@ -65,6 +65,11 @@ class OnPolicyRunner:
 
         self.current_learning_iteration = 0
 
+        # Initial CPU weight sync for fast inference during first rollout
+        if self._is_ttml:
+            self.alg.actor.mlp.sync_weights_to_cpu()
+            self.alg.critic.mlp.sync_weights_to_cpu()
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop for the specified number of iterations."""
         # Randomize initial episode lengths (for exploration)
