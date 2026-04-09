@@ -32,8 +32,10 @@ class OnPolicyRunner:
         self._is_ttml = is_ttml_device(device)
 
         # Initialize Tenstorrent NPU if using ttml device
+        # device="ttml" for single device, device="ttml:4" for 4 devices
         if self._is_ttml:
-            self._ttml_ctx = init_ttml_device()
+            num_devices = int(device.split(":")[1]) if ":" in device else 1
+            self._ttml_ctx, self._ddp_size = init_ttml_device(num_devices)
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
@@ -44,6 +46,10 @@ class OnPolicyRunner:
         # Create the algorithm
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
+
+        # Pass DDP size to algorithm for gradient sync
+        if self._is_ttml and hasattr(self.alg, '_ttml_ddp_size'):
+            self.alg._ttml_ddp_size = getattr(self, '_ddp_size', 1)
 
         # Create the logger (use CPU for ttml - logger only needs torch tensors for bookkeeping)
         self.logger = Logger(

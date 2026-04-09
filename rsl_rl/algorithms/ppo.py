@@ -17,7 +17,7 @@ from rsl_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, res
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
-from rsl_rl.utils.ttml_bridge import is_ttml_device, torch_to_ttml, ttml_to_torch
+from rsl_rl.utils.ttml_bridge import is_ttml_device, torch_to_ttml, ttml_to_torch, sync_gradients, create_mesh_mapper
 
 
 class PPO:
@@ -130,6 +130,8 @@ class PPO:
                 lr=learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-8, weight_decay=0.0,
             )
             self.ttml_optimizer = ttml.optimizers.AdamW(all_params, opt_config)
+            self._ttml_all_params = all_params
+            self._ttml_ddp_size = 1  # Updated by runner if multi-device
             # Dummy torch optimizer (unused but keeps API consistent for save/load)
             self.optimizer = torch.optim.Adam(
                 chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
@@ -322,10 +324,15 @@ class PPO:
             value_target = torch_to_ttml(batch.returns)
             critic_loss = ttml.ops.loss.mse_loss(critic_output, value_target, ttml.ops.ReduceType.MEAN)
 
-            # Backward + optimizer step on NPU
+            # Backward + gradient sync + optimizer step on NPU
             self.ttml_optimizer.zero_grad()
             actor_loss.backward(False)
             critic_loss.backward(False)
+
+            # Synchronize gradients across DDP devices (no-op for single device)
+            if self._ttml_ddp_size > 1:
+                sync_gradients(self._ttml_all_params)
+
             self.ttml_optimizer.step()
             ctx.reset_graph()
 
