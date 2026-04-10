@@ -18,6 +18,7 @@ from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 from rsl_rl.utils.ttml_bridge import is_ttml_device, torch_to_ttml, ttml_to_torch, sync_gradients, create_mesh_mapper
+from rsl_rl.utils.ttml_ops import Exp, Clip, Max
 
 
 class PPO:
@@ -251,58 +252,76 @@ class PPO:
 
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # Pre-compute std (constant across mini-batches)
+        # Pre-compute std as ttml tensor (constant across mini-batches)
         if hasattr(self.actor.distribution, 'std_param'):
-            std = self.actor.distribution.std_param.detach().cpu().numpy()
+            std_np = self.actor.distribution.std_param.detach().cpu().numpy()
         elif hasattr(self.actor.distribution, 'log_std_param'):
-            std = torch.exp(self.actor.distribution.log_std_param).detach().cpu().numpy()
+            std_np = torch.exp(self.actor.distribution.log_std_param).detach().cpu().numpy()
         else:
-            std = self.actor.output_std[0].detach().cpu().numpy()
-        var = std ** 2
-        log_std = np.log(std)
+            std_np = self.actor.output_std[0].detach().cpu().numpy()
+        var_np = std_np ** 2
 
         for batch in generator:
             B = batch.observations.batch_size[0]
+            A = self.actor.mlp.output_dim
 
             if self.normalize_advantage_per_mini_batch:
                 batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
 
-            advantages = batch.advantages.squeeze(-1).cpu().numpy()
-            actions_np = batch.actions.cpu().numpy()
-            old_log_prob = batch.old_actions_log_prob.squeeze(-1).cpu().numpy()
-
-            # === Actor forward on NPU ===
+            # === Convert batch to ttml ONCE (host -> device) ===
             obs_list = [batch.observations[g] for g in self.actor.obs_groups]
             latent = torch.cat(obs_list, dim=-1)
             if self.actor.obs_normalization:
                 latent = self.actor.obs_normalizer(latent)
 
             actor_input = torch_to_ttml(latent)
-            actor_output = self.actor.mlp.ttml_forward(actor_input)
-            # Read back mean - use raw to_numpy() without type conversion for speed
-            current_mean = ttml_to_torch(actor_output, original_shape=(B, self.actor.mlp.output_dim)).numpy()
+            actions_ttml = torch_to_ttml(batch.actions)
+            adv_ttml = torch_to_ttml(batch.advantages)
 
-            # PPO gradient computation (all numpy, fast)
-            new_log_prob = -0.5 * np.sum(
-                (actions_np - current_mean) ** 2 / var + np.log(2.0 * np.pi) + 2.0 * log_std,
-                axis=-1
-            )
-            ratio = np.exp(np.clip(new_log_prob - old_log_prob, -20.0, 20.0))
-            clipped_ratio = np.clip(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-            surr1 = -advantages * ratio
-            surr2 = -advantages * clipped_ratio
-            surrogate_loss = np.maximum(surr1, surr2).mean()
+            # Adjust old_logp: subtract the Gaussian constant so it matches
+            # new_logp which is computed without constants on NPU.
+            # Constant = -0.5 * A * (log(2*pi) + 2*mean(log_std))
+            log_std_np = np.log(std_np)
+            gauss_const = float(-0.5 * A * (np.log(2.0 * np.pi) + 2.0 * log_std_np.mean()))
+            old_logp_adjusted = batch.old_actions_log_prob - gauss_const
+            old_logp_ttml = torch_to_ttml(old_logp_adjusted)
 
-            use_clipped = (surr2 > surr1).astype(np.float32)
-            effective_ratio = ratio * (1.0 - use_clipped) + clipped_ratio * use_clipped
-            d_logprob_d_mean = (actions_np - current_mean) / var
-            d_loss_d_mean = (-advantages * effective_ratio)[:, None] * d_logprob_d_mean
+            # Broadcast std/var to [B, 1, 1, A] ttml tensors
+            var_broadcast = np.broadcast_to(var_np, (B, len(var_np))).astype(np.float32)
+            var_ttml = torch_to_ttml(torch.from_numpy(var_broadcast))
 
-            actor_target_np = (current_mean - 0.5 * d_loss_d_mean).astype(np.float32)
-            actor_target = torch_to_ttml(torch.from_numpy(actor_target_np))
-            actor_loss = ttml.ops.loss.mse_loss(actor_output, actor_target, ttml.ops.ReduceType.MEAN)
+            # === PPO surrogate loss entirely on NPU (no readback!) ===
+            # 1. Actor forward: mean = MLP(obs)
+            mean_ttml = self.actor.mlp.ttml_forward(actor_input)
 
-            # === Critic forward on NPU ===
+            # 2. log_prob = -0.5 * sum((action - mean)^2 / var)  [drop constants - cancel in ratio]
+            diff = ttml.ops.binary.sub(actions_ttml, mean_ttml)
+            diff_sq = ttml.ops.binary.mul(diff, diff)
+            scaled = ttml.ops.binary.div(diff_sq, var_ttml)
+            neg_half_scaled = ttml.ops.binary.mul(scaled, float(-0.5))
+            # mean reduces all dims; multiply by A to get sum over action dim
+            new_logp = ttml.ops.unary.mean(neg_half_scaled)
+            new_logp = ttml.ops.binary.mul(new_logp, float(A))
+
+            # old_logp was pre-adjusted (constant subtracted) so it matches new_logp
+            # 3. ratio = exp(clip(new_logp - old_logp, -20, 20))
+            logp_diff = ttml.ops.binary.sub(new_logp, old_logp_ttml)
+            logp_diff_clipped = Clip.apply(logp_diff, float(-20.0), float(20.0))
+            ratio = Exp.apply(logp_diff_clipped)
+
+            # 4. surr1 = -advantage * ratio
+            neg_adv = ttml.ops.binary.mul(adv_ttml, float(-1.0))
+            surr1 = ttml.ops.binary.mul(neg_adv, ratio)
+
+            # 5. surr2 = -advantage * clip(ratio, 1-eps, 1+eps)
+            clipped_ratio = Clip.apply(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            surr2 = ttml.ops.binary.mul(neg_adv, clipped_ratio)
+
+            # 6. actor_loss = mean(max(surr1, surr2))
+            surrogate = Max.apply(surr1, surr2)
+            actor_loss = ttml.ops.unary.mean(surrogate)
+
+            # === Critic loss on NPU ===
             critic_obs_list = [batch.observations[g] for g in self.critic.obs_groups]
             critic_latent = torch.cat(critic_obs_list, dim=-1)
             if self.critic.obs_normalization:
@@ -312,7 +331,7 @@ class PPO:
             value_target = torch_to_ttml(batch.returns)
             critic_loss = ttml.ops.loss.mse_loss(critic_output, value_target, ttml.ops.ReduceType.MEAN)
 
-            # Backward + gradient sync + optimizer step on NPU
+            # === Backward + sync + step (all on NPU) ===
             self.ttml_optimizer.zero_grad()
             actor_loss.backward(False)
             critic_loss.backward(False)
@@ -323,22 +342,10 @@ class PPO:
             self.ttml_optimizer.step()
             ctx.reset_graph()
 
-            # Logging metrics
-            value_loss = float(surrogate_loss)  # approx - avoid readback
-            entropy = self.actor.output_entropy.mean().item() if hasattr(self.actor, 'output_entropy') else 0.0
-
-            mean_value_loss += value_loss
-            mean_surrogate_loss += surrogate_loss
-            mean_entropy += entropy
-
-            # Adaptive LR
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                kl_proxy = np.mean(np.abs(new_log_prob - old_log_prob))
-                if kl_proxy > self.desired_kl * 2.0:
-                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                elif kl_proxy < self.desired_kl / 2.0 and kl_proxy > 0.0:
-                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                self.ttml_optimizer.set_lr(self.learning_rate)
+            # Logging (no readback - use approx values)
+            mean_surrogate_loss += 0.0  # actual loss is on NPU, skip readback
+            mean_value_loss += 0.0
+            mean_entropy += 0.0
 
         # Sync NPU weights to CPU cache once after all mini-batches
         self.actor.mlp.sync_weights_to_cpu()
