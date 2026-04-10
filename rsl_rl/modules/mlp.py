@@ -237,43 +237,38 @@ class TtmlMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass: torch.Tensor in, torch.Tensor out.
 
-        Uses CPU numpy cache when available (fast path for rollout inference).
-        Falls back to NPU forward when cache not synced.
+        Uses NPU forward with fast small-tensor readback for inference.
+        No autograd graph needed - resets immediately after forward.
         """
         import numpy as np
+        import ttml as _ttml
 
         B = x.shape[0]
-        D_in = self.input_dim
         D_out = self.output_dim
 
-        # Fast path: CPU inference using cached torch weights (BLAS-accelerated)
-        if self._cpu_weights is not None:
-            h = x.view(B, -1).detach().cpu().float()
-            # Pad input to match padded dims
-            D_pad = self._dims[0]
-            if h.shape[1] < D_pad:
-                h_padded = torch.zeros(B, D_pad)
-                h_padded[:, :h.shape[1]] = h
-                h = h_padded
-
-            for i, (W, b) in enumerate(self._cpu_weights):
-                h = h @ W.T
-                if b is not None:
-                    h = h + b
-                if i < self._num_hidden:
-                    h = torch.relu(h)
-
-            return h[:B, :D_out].to(x.device)
-
-        # Slow path: NPU forward (used before first sync)
+        # NPU inference: send input, forward on NPU, read back small output
         x_ttml = torch_to_ttml(x.view(B, -1))
         out_ttml = self.ttml_forward(x_ttml)
-        result = ttml_to_torch(out_ttml, original_shape=(B, D_out))
 
-        import ttml
-        ttml.autograd.AutoContext.get_instance().reset_graph()
+        # Fast readback - handle multi-device with composer
+        ctx = _ttml.autograd.AutoContext.get_instance()
+        device = ctx.get_device()
+        if device.get_num_devices() > 1:
+            composer = _ttml.core.distributed.concat_mesh_to_tensor_composer(device, 0)
+            arr = np.array(out_ttml.to_numpy(composer=composer), dtype=np.float32)
+        else:
+            arr = np.array(out_ttml.to_numpy(), dtype=np.float32)
+        ctx.reset_graph()
 
-        return result.to(x.device)
+        # Unpad: [B_pad, 1, 1, D_pad] -> [B, D_out]
+        if arr.ndim == 4:
+            arr = arr[:B, 0, 0, :D_out]
+        elif arr.ndim == 3:
+            arr = arr[:B, 0, :D_out]
+        else:
+            arr = arr[:B, :D_out]
+
+        return torch.from_numpy(arr).to(x.device)
 
     def init_weights(self, scales: float | tuple[float]) -> None:
         """Initialize weights (approximate orthogonal via Xavier scaled by gain)."""

@@ -18,7 +18,7 @@ from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 from rsl_rl.utils.ttml_bridge import is_ttml_device, torch_to_ttml, ttml_to_torch, sync_gradients, create_mesh_mapper
-from rsl_rl.utils.ttml_ops import Exp, Clip, Max
+from rsl_rl.utils.ttml_ops import FusedPPOLoss
 
 
 class PPO:
@@ -290,36 +290,13 @@ class PPO:
             var_broadcast = np.broadcast_to(var_np, (B, len(var_np))).astype(np.float32)
             var_ttml = torch_to_ttml(torch.from_numpy(var_broadcast))
 
-            # === PPO surrogate loss entirely on NPU (no readback!) ===
-            # 1. Actor forward: mean = MLP(obs)
+            # === Fused PPO surrogate loss on NPU (single Function, no per-op overhead) ===
             mean_ttml = self.actor.mlp.ttml_forward(actor_input)
-
-            # 2. log_prob = -0.5 * sum((action - mean)^2 / var)  [drop constants - cancel in ratio]
-            diff = ttml.ops.binary.sub(actions_ttml, mean_ttml)
-            diff_sq = ttml.ops.binary.mul(diff, diff)
-            scaled = ttml.ops.binary.div(diff_sq, var_ttml)
-            neg_half_scaled = ttml.ops.binary.mul(scaled, float(-0.5))
-            # mean reduces all dims; multiply by A to get sum over action dim
-            new_logp = ttml.ops.unary.mean(neg_half_scaled)
-            new_logp = ttml.ops.binary.mul(new_logp, float(A))
-
-            # old_logp was pre-adjusted (constant subtracted) so it matches new_logp
-            # 3. ratio = exp(clip(new_logp - old_logp, -20, 20))
-            logp_diff = ttml.ops.binary.sub(new_logp, old_logp_ttml)
-            logp_diff_clipped = Clip.apply(logp_diff, float(-20.0), float(20.0))
-            ratio = Exp.apply(logp_diff_clipped)
-
-            # 4. surr1 = -advantage * ratio
-            neg_adv = ttml.ops.binary.mul(adv_ttml, float(-1.0))
-            surr1 = ttml.ops.binary.mul(neg_adv, ratio)
-
-            # 5. surr2 = -advantage * clip(ratio, 1-eps, 1+eps)
-            clipped_ratio = Clip.apply(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-            surr2 = ttml.ops.binary.mul(neg_adv, clipped_ratio)
-
-            # 6. actor_loss = mean(max(surr1, surr2))
-            surrogate = Max.apply(surr1, surr2)
-            actor_loss = ttml.ops.unary.mean(surrogate)
+            surrogate_per_sample = FusedPPOLoss.apply(
+                mean_ttml, actions_ttml, old_logp_ttml, adv_ttml, var_ttml,
+                float(self.clip_param), float(A)
+            )
+            actor_loss = ttml.ops.unary.mean(surrogate_per_sample)
 
             # === Critic loss on NPU ===
             critic_obs_list = [batch.observations[g] for g in self.critic.obs_groups]
