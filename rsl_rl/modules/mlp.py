@@ -232,7 +232,7 @@ class TtmlMLP(nn.Module):
             else:
                 b = None
 
-            self._cpu_weights.append((W, b))
+            self._cpu_weights.append((torch.from_numpy(W), torch.from_numpy(b) if b is not None else None))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass: torch.Tensor in, torch.Tensor out.
@@ -246,26 +246,24 @@ class TtmlMLP(nn.Module):
         D_in = self.input_dim
         D_out = self.output_dim
 
-        # Fast path: CPU inference using cached numpy weights
+        # Fast path: CPU inference using cached torch weights (BLAS-accelerated)
         if self._cpu_weights is not None:
-            h = x.view(B, -1).detach().cpu().numpy().astype(np.float32)
+            h = x.view(B, -1).detach().cpu().float()
             # Pad input to match padded dims
             D_pad = self._dims[0]
             if h.shape[1] < D_pad:
-                h_padded = np.zeros((B, D_pad), dtype=np.float32)
+                h_padded = torch.zeros(B, D_pad)
                 h_padded[:, :h.shape[1]] = h
                 h = h_padded
 
             for i, (W, b) in enumerate(self._cpu_weights):
-                h = h @ W.T  # [B, out_padded]
+                h = h @ W.T
                 if b is not None:
                     h = h + b
-                # Activation for hidden layers
                 if i < self._num_hidden:
-                    h = np.maximum(h, 0)  # ReLU (matches ttml.ops.unary.relu)
+                    h = torch.relu(h)
 
-            # Unpad output
-            return torch.from_numpy(h[:B, :D_out].copy()).to(x.device)
+            return h[:B, :D_out].to(x.device)
 
         # Slow path: NPU forward (used before first sync)
         x_ttml = torch_to_ttml(x.view(B, -1))

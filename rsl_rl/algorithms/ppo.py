@@ -347,9 +347,14 @@ class PPO:
             mean_value_loss += 0.0
             mean_entropy += 0.0
 
-        # Sync NPU weights to CPU cache once after all mini-batches
-        self.actor.mlp.sync_weights_to_cpu()
-        self.critic.mlp.sync_weights_to_cpu()
+        # Sync NPU weights to CPU cache periodically (not every iteration).
+        # The CPU cache is used for rollout inference - slightly stale weights are fine.
+        if not hasattr(self, '_ttml_update_count'):
+            self._ttml_update_count = 0
+        self._ttml_update_count += 1
+        if self._ttml_update_count % 10 == 0:
+            self.actor.mlp.sync_weights_to_cpu()
+            self.critic.mlp.sync_weights_to_cpu()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
