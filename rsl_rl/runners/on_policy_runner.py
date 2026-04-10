@@ -32,9 +32,13 @@ class OnPolicyRunner:
         self._is_ttml = is_ttml_device(device)
 
         # Initialize Tenstorrent NPU if using ttml device
-        # device="ttml" for single device, device="ttml:4" for 4 devices
+        # device="ttml" for single device, device="ttml:N" for N devices, device="ttml:auto" for auto-detect
         if self._is_ttml:
-            num_devices = int(device.split(":")[1]) if ":" in device else 1
+            if ":" in device:
+                suffix = device.split(":")[1]
+                num_devices = 0 if suffix == "auto" else int(suffix)
+            else:
+                num_devices = 1
             self._ttml_ctx, self._ddp_size = init_ttml_device(num_devices)
 
         # Setup multi-GPU training if enabled

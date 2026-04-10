@@ -111,13 +111,38 @@ def ttml_to_torch(ttml_tensor, original_shape: tuple[int, int]) -> torch.Tensor:
     return torch.from_numpy(arr.copy())
 
 
-def init_ttml_device(num_devices: int = 1):
-    """Open the Tenstorrent device mesh.
+def _detect_hardware():
+    """Detect Tenstorrent hardware: architecture and device count."""
+    _, ttnn = _ensure_ttml()
+    arch = ttnn.get_arch_name()  # "wormhole_b0" or "blackhole"
+    num_available = ttnn.GetNumAvailableDevices()
+    num_pcie = ttnn.GetNumPCIeDevices()
+    return arch, num_available, num_pcie
+
+
+# Known mesh topologies per architecture and device count.
+# Format: (mesh_shape, enable_ddp, enable_tp)
+_MESH_CONFIGS = {
+    # Wormhole B0 (T3K = 8 chips in 2x4, QuietBox = 1 chip)
+    ("wormhole_b0", 1): (None, False, False),          # single device
+    ("wormhole_b0", 4): ([2, 2], True, True),           # 4-chip: DDP=2, TP=2
+    ("wormhole_b0", 8): ([2, 4], True, True),           # T3K: DDP=2, TP=4
+    # Blackhole (single chip or multi-chip configurations)
+    ("blackhole", 1):   (None, False, False),           # single device
+    ("blackhole", 2):   ([1, 2], True, True),           # 2-chip
+    ("blackhole", 4):   ([2, 2], True, True),           # 4-chip
+    ("blackhole", 8):   ([2, 4], True, True),           # 8-chip (if available)
+}
+
+
+def init_ttml_device(num_devices: int = 0):
+    """Open the Tenstorrent device mesh with auto-detection.
 
     Args:
         num_devices: Number of devices to use.
-            1 = single device (default, no fabric needed)
-            4 = 4 devices in [2,2] mesh with DDP(2) + TP(2)
+            0 = auto-detect (use all available devices)
+            1 = single device (no fabric)
+            N = use N devices with DDP
 
     Returns:
         (ctx, ddp_size) tuple.
@@ -126,29 +151,42 @@ def init_ttml_device(num_devices: int = 1):
     ttml, ttnn = _ensure_ttml()
     ctx = ttml.autograd.AutoContext.get_instance()
 
+    arch, num_available, num_pcie = _detect_hardware()
+
+    if num_devices == 0:
+        num_devices = num_available
+    if num_devices > num_available:
+        print(f"[ttml] Requested {num_devices} devices but only {num_available} available. Using {num_available}.")
+        num_devices = num_available
+
+    print(f"[ttml] Detected: arch={arch}, available={num_available}, pcie={num_pcie}, using={num_devices}")
+
+    # Single device - no fabric needed
     if num_devices <= 1:
         ctx.open_device()
-        print("[ttml] Tenstorrent NPU device opened (single device).")
+        print(f"[ttml] {arch} single device opened.")
         return ctx, 1
 
-    # Multi-device: enable fabric and open mesh
-    os.environ.setdefault("TT_METAL_HOME", "/home/ttuser/tt-metal")
-    os.environ.setdefault("TT_METAL_RUNTIME_ROOT", os.environ["TT_METAL_HOME"])
-    ttml.core.distributed.enable_fabric(num_devices)
-
-    if num_devices == 4:
-        ctx.open_device([2, 2])
-        ctx.initialize_parallelism_context(
-            ttml.autograd.DistributedConfig(enable_ddp=True, enable_tp=True)
-        )
-    elif num_devices == 8:
-        ttml.core.distributed.enable_fabric(8)
-        ctx.open_device([2, 4])
-        ctx.initialize_parallelism_context(
-            ttml.autograd.DistributedConfig(enable_ddp=True, enable_tp=True)
-        )
+    # Multi-device: look up mesh config
+    config_key = (arch, num_devices)
+    if config_key not in _MESH_CONFIGS:
+        # Fallback: try [1, N] with DDP only
+        print(f"[ttml] No known mesh config for ({arch}, {num_devices}). Trying [1, {num_devices}].")
+        mesh_shape = [1, num_devices]
+        enable_ddp, enable_tp = True, True
     else:
-        raise ValueError(f"Unsupported num_devices={num_devices}. Use 1, 4, or 8.")
+        mesh_shape, enable_ddp, enable_tp = _MESH_CONFIGS[config_key]
+
+    os.environ.setdefault("TT_METAL_HOME", os.environ.get("TT_METAL_HOME", "/home/ttuser/tt-metal"))
+    os.environ.setdefault("TT_METAL_RUNTIME_ROOT", os.environ["TT_METAL_HOME"])
+
+    ttml.core.distributed.enable_fabric(num_devices)
+    ctx.open_device(mesh_shape)
+
+    dc = ttml.autograd.DistributedConfig()
+    dc.enable_ddp = enable_ddp
+    dc.enable_tp = enable_tp
+    ctx.initialize_parallelism_context(dc)
 
     pctx = ctx.get_parallelism_context()
     ddp_size = pctx.get_ddp_size()
