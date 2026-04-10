@@ -329,7 +329,7 @@ class PPO:
         if not hasattr(self, '_ttml_update_count'):
             self._ttml_update_count = 0
         self._ttml_update_count += 1
-        if self._ttml_update_count % 10 == 0:
+        if self._ttml_update_count % 50 == 0:
             self.actor.mlp.sync_weights_to_cpu()
             self.critic.mlp.sync_weights_to_cpu()
 
